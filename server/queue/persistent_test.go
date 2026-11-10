@@ -257,3 +257,90 @@ func TestWithTaskStoreRestoresPausedStateAfterRestart(t *testing.T) {
 	restored := WithTaskStore(ctx2, q2, store)
 	assert.True(t, restored.Info(ctx2).Paused)
 }
+
+// Startup recovery must drop a terminal workflow's persisted queue task
+// even when its required agent label has no connected worker. In particular,
+// canceled security-isolated workflows must not reserve FIFO positions forever.
+func TestWithTaskStorePrunesTerminalWorkflowTasks(t *testing.T) {
+	ctx, cancel, q := setupTestQueue(t)
+	defer cancel(nil)
+
+	terminal := genDummyTask()
+	terminal.Labels = map[string]string{"pool": "security-isolated"}
+	terminal.ConcurrencyGroup = "1//adacavo-security"
+	terminal.ConcurrencyLimit = 1
+	active := genDummyTask()
+	active.ID = "2"
+	active.Labels = map[string]string{"pool": "bootstrap-ci"}
+	active.ConcurrencyGroup = terminal.ConcurrencyGroup
+	active.ConcurrencyLimit = 1
+
+	store := store_mocks.NewMockStore(t)
+	store.EXPECT().TaskList().Return([]*model.Task{terminal, active}, nil).Once()
+	store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusSkipped}, nil).Once()
+	store.EXPECT().TaskDelete("1").Return(nil).Once()
+	store.EXPECT().WorkflowLoad(int64(2)).Return(&model.Workflow{ID: 2, State: model.StatusPending}, nil).Once()
+	store.EXPECT().ServerConfigGet(serverConfigQueuePaused).Return("", types.ErrRecordNotExist).Once()
+
+	WithTaskStore(ctx, q, store)
+	info := q.Info(ctx)
+	assert.Equal(t, 1, info.Stats.Pending, "only the active task must be restored")
+	assert.Equal(t, "2", info.Pending[0].ID, "a terminal task must not block later active work")
+}
+
+// Unknown workflow state must NOT be guessed terminal. Preserve the task
+// when the database cannot load its workflow.
+func TestWithTaskStoreKeepsTaskOnWorkflowLookupFailure(t *testing.T) {
+	ctx, cancel, q := setupTestQueue(t)
+	defer cancel(nil)
+	task := genDummyTask()
+	store := store_mocks.NewMockStore(t)
+	store.EXPECT().TaskList().Return([]*model.Task{task}, nil).Once()
+	store.EXPECT().WorkflowLoad(int64(1)).Return(nil, assert.AnError).Once()
+	store.EXPECT().ServerConfigGet(serverConfigQueuePaused).Return("", types.ErrRecordNotExist).Once()
+
+	WithTaskStore(ctx, q, store)
+	info := q.Info(ctx)
+	assert.Equal(t, 1, info.Stats.Pending, "transient database errors cannot silently discard valid jobs")
+}
+
+func TestWithTaskStoreMissingWorkflowDropsOrphan(t *testing.T) {
+	ctx, cancel, q := setupTestQueue(t)
+	defer cancel(nil)
+	task := genDummyTask()
+	store := store_mocks.NewMockStore(t)
+	store.EXPECT().TaskList().Return([]*model.Task{task}, nil).Once()
+	store.EXPECT().WorkflowLoad(int64(1)).Return(nil, types.ErrRecordNotExist).Once()
+	store.EXPECT().TaskDelete("1").Return(nil).Once()
+	store.EXPECT().ServerConfigGet(serverConfigQueuePaused).Return("", types.ErrRecordNotExist).Once()
+
+	WithTaskStore(ctx, q, store)
+	assert.Equal(t, 0, q.Info(ctx).Stats.Pending, "orphan task must not retain a FIFO position")
+}
+
+func TestWithTaskStorePreservesTaskWhenCleanupFails(t *testing.T) {
+	ctx, cancel, q := setupTestQueue(t)
+	defer cancel(nil)
+	task := genDummyTask()
+	store := store_mocks.NewMockStore(t)
+	store.EXPECT().TaskList().Return([]*model.Task{task}, nil).Once()
+	store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusSkipped}, nil).Once()
+	store.EXPECT().TaskDelete("1").Return(assert.AnError).Once()
+	store.EXPECT().ServerConfigGet(serverConfigQueuePaused).Return("", types.ErrRecordNotExist).Once()
+
+	WithTaskStore(ctx, q, store)
+	assert.Equal(t, 1, q.Info(ctx).Stats.Pending, "database cleanup errors must not silently drop persisted jobs")
+}
+
+func TestWithTaskStoreKeepsTaskForNilWorkflowResponse(t *testing.T) {
+	ctx, cancel, q := setupTestQueue(t)
+	defer cancel(nil)
+	task := genDummyTask()
+	store := store_mocks.NewMockStore(t)
+	store.EXPECT().TaskList().Return([]*model.Task{task}, nil).Once()
+	store.EXPECT().WorkflowLoad(int64(1)).Return(nil, nil).Once()
+	store.EXPECT().ServerConfigGet(serverConfigQueuePaused).Return("", types.ErrRecordNotExist).Once()
+
+	WithTaskStore(ctx, q, store)
+	assert.Equal(t, 1, q.Info(ctx).Stats.Pending, "invalid lookup result must not discard persisted jobs")
+}
