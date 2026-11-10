@@ -31,8 +31,42 @@ import (
 // WithTaskStore returns a queue that is backed by the TaskStore. This
 // ensures the task Queue can be restored when the system starts.
 func WithTaskStore(ctx context.Context, q Queue, s store.Store) Queue {
-	tasks, _ := s.TaskList()
-	if err := q.PushAtOnce(ctx, tasks); err != nil {
+	tasks, err := s.TaskList()
+	if err != nil {
+		log.Error().Err(err).Msg("Could not restore persisted queue tasks")
+	}
+	// A previous cancellation may leave a terminal workflow's task in the
+	// persistent queue. The Poll guard cannot clean it up if no agent matches
+	// its (possibly retired) labels, allowing it to reserve a FIFO slot forever.
+	//
+	// Only discard tasks whose workflow is definitively terminal or missing;
+	// retain jobs when workflow lookup or task-store cleanup is uncertain.
+	restored := make([]*model.Task, 0, len(tasks))
+	for _, task := range tasks {
+		id, parseErr := strconv.ParseInt(task.ID, 10, 64)
+		if parseErr != nil {
+			log.Error().Err(parseErr).Str("id", task.ID).Msg("Cannot resolve persisted queue workflow id")
+			restored = append(restored, task)
+			continue
+		}
+		workflow, loadErr := s.WorkflowLoad(id)
+		if loadErr != nil && !errors.Is(loadErr, types.ErrRecordNotExist) {
+			log.Error().Err(loadErr).Str("id", task.ID).Msg("Cannot inspect persisted workflow; retaining task")
+			restored = append(restored, task)
+			continue
+		}
+		if loadErr == nil && (workflow == nil || !isTerminalWorkflowState(workflow.State)) {
+			restored = append(restored, task)
+			continue
+		}
+		if deleteErr := s.TaskDelete(task.ID); deleteErr != nil && !errors.Is(deleteErr, types.ErrRecordNotExist) {
+			log.Error().Err(deleteErr).Str("id", task.ID).Msg("Cannot prune stale persisted queue task; retaining for retry")
+			restored = append(restored, task)
+			continue
+		}
+		log.Warn().Str("id", task.ID).Msg("Pruned terminal or missing-workflow task during queue restoration")
+	}
+	if err := q.PushAtOnce(ctx, restored); err != nil {
 		log.Error().Err(err).Msg("PushAtOnce failed")
 	}
 	return &persistentQueue{q, s}
